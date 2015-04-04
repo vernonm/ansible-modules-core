@@ -51,6 +51,11 @@ options:
       - system image for creating the virtual machine (e.g., b39f27a8b8c64d52b05eac6a62ebad85__Ubuntu_DAILY_BUILD-precise-12_04_3-LTS-amd64-server-20131205-en-us-30GB)
     required: true
     default: null
+  vm_image_name:
+    description:
+      - created VM image (not OS system image) in the storage account
+    required: false
+    default: null
   role_size:
     description:
       - azure role size for the new virtual machine (e.g., Small, ExtraLarge, A6)
@@ -254,9 +259,12 @@ def create_virtual_machine(module, azure):
     role_size = module.params.get('role_size')
     storage_account = module.params.get('storage_account')
     image = module.params.get('image')
+    vm_image = module.params.get('vm_image')
     virtual_network_name = module.params.get('virtual_network_name')
     wait = module.params.get('wait')
     wait_timeout = int(module.params.get('wait_timeout'))
+
+    use_vm_image = vm_image is not None and image is None
 
     # Check if a deployment with the same name already exists
     cloud_service_name_available = azure.check_hosted_service_name_availability(name)
@@ -272,23 +280,27 @@ def create_virtual_machine(module, azure):
             module.fail_json(msg="failed to create the new service name, it already exists: %s" % str(e))
 
         # Create linux configuration
-        disable_ssh_password_authentication = not password
-        linux_config = LinuxConfigurationSet(hostname, user, password, disable_ssh_password_authentication)
+        if not use_vm_image:
+            disable_ssh_password_authentication = not password
+            linux_config = LinuxConfigurationSet(hostname, user, password, disable_ssh_password_authentication)
 
-        # Add ssh certificates if specified
-        if ssh_cert_path:
-            fingerprint, pkcs12_base64 = get_ssh_certificate_tokens(module, ssh_cert_path)
-            # Add certificate to cloud service
-            result = azure.add_service_certificate(name, pkcs12_base64, 'pfx', '')
-            _wait_for_completion(azure, result, wait_timeout, "add_service_certificate")
+            # Add ssh certificates if specified
+            if ssh_cert_path:
+                fingerprint, pkcs12_base64 = get_ssh_certificate_tokens(module, ssh_cert_path)
+                # Add certificate to cloud service
+                result = azure.add_service_certificate(name, pkcs12_base64, 'pfx', '')
+                _wait_for_completion(azure, result, wait_timeout, "add_service_certificate")
 
-            # Create ssh config
-            ssh_config = SSH()
-            ssh_config.public_keys = PublicKeys()
-            authorized_keys_path = u'/home/%s/.ssh/authorized_keys' % user
-            ssh_config.public_keys.public_keys.append(PublicKey(path=authorized_keys_path, fingerprint=fingerprint))
-            # Append ssh config to linux machine config
-            linux_config.ssh = ssh_config
+                # Create ssh config
+                ssh_config = SSH()
+                ssh_config.public_keys = PublicKeys()
+                authorized_keys_path = u'/home/%s/.ssh/authorized_keys' % user
+                ssh_config.public_keys.public_keys.append(PublicKey(path=authorized_keys_path, fingerprint=fingerprint))
+                # Append ssh config to linux machine config
+                linux_config.ssh = ssh_config
+        else:
+            # When using vm_image, you can't specify an OS configuration set (burned into the image)
+            linux_config = None
 
         # Create network configuration
         network_config = ConfigurationSetInputEndpoints()
@@ -306,7 +318,12 @@ def create_virtual_machine(module, azure):
         disk_prefix = u'%s-%s' % (name, name)
         media_link = u'http://%s.blob.core.windows.net/vhds/%s-%s.vhd' % (storage_account, disk_prefix, today)
         # Create system hard disk
-        os_hd = OSVirtualHardDisk(image, media_link)
+        if image:
+            os_hd = OSVirtualHardDisk(image, media_link)
+        else:
+            # When using vm_image_name, you can't specify an OS Virtual Hard Disk,
+            # since the image already contains the VHD configuration
+            os_hd = None
 
         # Spin up virtual machine
         try:
@@ -318,13 +335,13 @@ def create_virtual_machine(module, azure):
                                                              system_config=linux_config,
                                                              network_config=network_config,
                                                              os_virtual_hard_disk=os_hd,
+                                                             vm_image_name=vm_image,
                                                              role_size=role_size,
                                                              role_type='PersistentVMRole',
                                                              virtual_network_name=virtual_network_name)
             _wait_for_completion(azure, result, wait_timeout, "create_virtual_machine_deployment")
         except WindowsAzureError as e:
             module.fail_json(msg="failed to create the new virtual machine, error was: %s" % str(e))
-
 
     try:
         deployment = azure.get_deployment_by_name(service_name=name, deployment_name=name)
@@ -423,6 +440,7 @@ def main():
             user=dict(),
             password=dict(),
             image=dict(),
+            vm_image=dict(),
             virtual_network_name=dict(default=None),
             state=dict(default='present'),
             wait=dict(type='bool', default=False),
@@ -448,16 +466,16 @@ def main():
         # Changed is always set to true when provisioning new instances
         if not module.params.get('name'):
             module.fail_json(msg='name parameter is required for new instance')
-        if not module.params.get('image'):
-            module.fail_json(msg='image parameter is required for new instance')
+        if not module.params.get('image') and not module.params.get('vm_image'):
+            module.fail_json(msg='image or vm_image parameter is required for new instance')
         if not module.params.get('user'):
             module.fail_json(msg='user parameter is required for new instance')
         if not module.params.get('location'):
             module.fail_json(msg='location parameter is required for new instance')
         if not module.params.get('storage_account'):
             module.fail_json(msg='storage_account parameter is required for new instance')
-        if not module.params.get('password'):
-            module.fail_json(msg='password parameter is required for new instance')
+        if not module.params.get('password') and not module.params.get('ssh_cert_path') and not module.params.get('vm_image'):
+            module.fail_json(msg='password or ssh certificate path parameter is required for new instance from image')
         (changed, public_dns_name, deployment) = create_virtual_machine(module, azure)
 
     module.exit_json(changed=changed, public_dns_name=public_dns_name, deployment=json.loads(json.dumps(deployment, default=lambda o: o.__dict__)))
